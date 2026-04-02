@@ -4,7 +4,7 @@
 # 哪吒面板 V2 自动备份与管理脚本
 # ==========================================
 
-CURRENT_VERSION="1.0.6"
+CURRENT_VERSION="1.0.7"
 CONFIG_FILE="/root/.nezha_backup_config"
 UPDATE_URL="https://raw.githubusercontent.com/ioiy/nezha_backup/main/bf.sh"
 
@@ -105,9 +105,9 @@ run_backup() {
     
     FILE_SIZE=$(du -sh "$BACKUP_FILE" | awk '{print $1}')
 
-    # 2. 上传到 S3 (加入了极低内存参数和交互模式实时进度条)
+    # 2. 上传到 S3 (加入了极低内存参数、交互模式实时进度条、强制不检查Bucket)
     echo "开始上传至 S3..."
-    local RCLONE_OPTS="--transfers 1 --buffer-size 0 --use-mmap"
+    local RCLONE_OPTS="--transfers 1 --buffer-size 0 --use-mmap --s3-no-check-bucket"
     if [ -t 0 ]; then
         RCLONE_OPTS="$RCLONE_OPTS -P" # 只有手动运行时才显示上传进度
     fi
@@ -120,7 +120,7 @@ run_backup() {
 
     # 3. 清理旧备份
     echo "清理 ${RETENTION_DAYS} 天前的旧备份..."
-    local DELETE_OPTS="--min-age ${RETENTION_DAYS}d"
+    local DELETE_OPTS="--min-age ${RETENTION_DAYS}d --s3-no-check-bucket"
     if [ "$RETAIN_FIRST_DAY" == "true" ]; then
         # 排除包含 -01_ 的文件，实现每月1号长效保留
         DELETE_OPTS="$DELETE_OPTS --exclude *_*-01_*.*"
@@ -189,7 +189,7 @@ quick_check_s3() {
     if [ -z "$S3_BUCKET" ]; then
         S3_CONN_STATUS="\033[31m[未配置]\033[0m"
     else
-        if rclone lsf "nezha_s3:${S3_BUCKET}" --contimeout 5s --retries 1 > /dev/null 2>&1; then
+        if rclone lsf "nezha_s3:${S3_BUCKET}" --s3-no-check-bucket --contimeout 5s --retries 1 > /dev/null 2>&1; then
             S3_CONN_STATUS="\033[32m[✅ 正常]\033[0m"
         else
             S3_CONN_STATUS="\033[31m[❌ 异常]\033[0m"
@@ -208,7 +208,7 @@ check_s3() {
     else
         echo "正在尝试连接并获取 S3 数据 (超时 10 秒)..."
         # 使用 lsf 列出目录代替 mkdir，避免触发 bucket 创建权限问题
-        if rclone lsf "nezha_s3:${S3_BUCKET}" --contimeout 10s --retries 1 > /dev/null 2>&1; then
+        if rclone lsf "nezha_s3:${S3_BUCKET}" --s3-no-check-bucket --contimeout 10s --retries 1 > /dev/null 2>&1; then
             echo -e "\n\033[32m[成功]\033[0m 连接正常！可以顺利访问 ${S3_BUCKET} 桶。"
         else
             echo -e "\n\033[31m[失败]\033[0m 连接异常！请检查：\n1. 访问密钥或 Endpoint 是否填写错误\n2. 存储桶 ${S3_BUCKET} 是否存在\n3. 机器网络是否通畅"
@@ -404,7 +404,7 @@ restore_backup() {
 
     echo "正在连接 S3 获取最新的备份列表..."
     # 同时兼容读取普通备份(.tar.gz)和加密备份(.enc)
-    LATEST_BACKUP=$(rclone lsf "nezha_s3:${S3_BUCKET}/nezha_backups/" | grep -E '\.tar\.gz$|\.enc$' | sort -r | head -n 1)
+    LATEST_BACKUP=$(rclone lsf "nezha_s3:${S3_BUCKET}/nezha_backups/" --s3-no-check-bucket | grep -E '\.tar\.gz$|\.enc$' | sort -r | head -n 1)
     
     if [ -z "$LATEST_BACKUP" ]; then
         echo -e "\n\033[31m[失败]\033[0m 未在 S3 存储桶中找到任何备份文件！"
@@ -419,7 +419,7 @@ restore_backup() {
     if [[ "$confirm_restore" =~ ^[Yy]$ ]]; then
         echo -e "\n1. 正在从 S3 下载备份文件 (显示实时进度)..."
         # 强制带 -P 显示下载进度
-        rclone copy "nezha_s3:${S3_BUCKET}/nezha_backups/${LATEST_BACKUP}" /tmp/ -P --transfers 1 --buffer-size 0 --use-mmap
+        rclone copy "nezha_s3:${S3_BUCKET}/nezha_backups/${LATEST_BACKUP}" /tmp/ -P --transfers 1 --buffer-size 0 --use-mmap --s3-no-check-bucket
         
         if [ $? -eq 0 ]; then
             echo -e "\n2. 下载成功，正在停止哪吒面板服务..."
