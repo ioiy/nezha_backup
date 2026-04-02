@@ -4,7 +4,7 @@
 # 哪吒面板 V2 自动备份与管理脚本
 # ==========================================
 
-CURRENT_VERSION="1.0.0"
+CURRENT_VERSION="1.0.1"
 CONFIG_FILE="/root/.nezha_backup_config"
 UPDATE_URL="https://raw.githubusercontent.com/ioiy/nezha_backup/main/bf.sh"
 
@@ -64,7 +64,7 @@ run_backup() {
     source "$CONFIG_FILE"
     
     if [ -z "$S3_BUCKET" ]; then
-        send_tg "FAIL" "未配置 S3 储存桶名称，请进入控制面板配置。"
+        send_tg "FAIL" "未配置 S3 存储桶名称，请进入控制面板配置。"
         exit 1
     fi
 
@@ -110,7 +110,7 @@ run_backup() {
 setup_s3() {
     clear
     echo "=========================================="
-    echo "          配置 S3 储存桶 (Rclone)         "
+    echo "          配置 S3 存储桶 (Rclone)         "
     echo "=========================================="
     
     if ! command -v rclone &> /dev/null; then
@@ -119,11 +119,14 @@ setup_s3() {
     fi
 
     echo ""
-    read -p "请输入你的 S3 API Endpoint (例如: https://s3.enzonix.com): " s3_endpoint
-    read -p "请输入 Access Key (AK): " s3_ak
-    read -p "请输入 Secret Key (SK): " s3_sk
-    read -p "请输入你要储存的 Bucket (桶) 名称: " S3_BUCKET
+    read -p "请输入 Endpoint (例如: https://ny-1s.enzonix.com): " s3_endpoint
+    read -p "请输入 地区 (例如 us-east-1，直接回车默认为 us-east-1): " s3_region
+    s3_region=${s3_region:-us-east-1} # 默认值设置
+    read -p "请输入 访问密钥 Id: " s3_ak
+    read -p "请输入 安全访问密钥: " s3_sk
+    read -p "请输入 存储桶 (Bucket) 名称: " S3_BUCKET
 
+    # 写入 rclone 配置文件，加入 region 和 force_path_style 修复兼容性问题
     mkdir -p /root/.config/rclone
     cat > /root/.config/rclone/rclone.conf << EOF
 [nezha_s3]
@@ -133,6 +136,8 @@ env_auth = false
 access_key_id = ${s3_ak}
 secret_access_key = ${s3_sk}
 endpoint = ${s3_endpoint}
+region = ${s3_region}
+force_path_style = true
 EOF
 
     save_config
@@ -144,17 +149,17 @@ EOF
 check_s3() {
     clear
     echo "=========================================="
-    echo "          测试 S3 储存桶连接状态          "
+    echo "          测试 S3 存储桶连接状态          "
     echo "=========================================="
     if [ -z "$S3_BUCKET" ]; then
-        echo -e "\033[31m[错误]\033[0m 尚未配置 S3 储存桶名称，请先配置！"
+        echo -e "\033[31m[错误]\033[0m 尚未配置 S3 存储桶名称，请先配置！"
     else
         echo "正在尝试连接并获取 S3 数据 (超时 10 秒)..."
         # 尝试创建一个测试目录，或者列出文件，以验证权限和连通性
         if rclone mkdir "nezha_s3:${S3_BUCKET}/nezha_backups" --contimeout 10s --retries 1 > /dev/null 2>&1; then
             echo -e "\n\033[32m[成功]\033[0m 连接正常！可以顺利访问 ${S3_BUCKET} 桶。"
         else
-            echo -e "\n\033[31m[失败]\033[0m 连接异常！请检查：\n1. API / AK / SK 是否填写错误\n2. 储存桶 ${S3_BUCKET} 是否存在\n3. 机器网络是否通畅"
+            echo -e "\n\033[31m[失败]\033[0m 连接异常！请检查：\n1. 访问密钥或 Endpoint 是否填写错误\n2. 存储桶 ${S3_BUCKET} 是否存在\n3. 机器网络是否通畅"
         fi
     fi
     echo ""
@@ -281,14 +286,14 @@ show_menu() {
         echo -e "=========================================="
         echo -e "   \033[36m哪吒面板 V2 数据备份控制台 \033[32m[v${CURRENT_VERSION}]\033[0m"
         echo -e "=========================================="
-        echo -e " S3 储存桶  : \033[33m${S3_BUCKET:-未配置}\033[0m"
+        echo -e " S3 存储桶  : \033[33m${S3_BUCKET:-未配置}\033[0m"
         echo -e " 保留天数   : \033[33m${RETENTION_DAYS} 天\033[0m"
         echo -e " 通知模式   : \033[33m${NOTIFY_MODE}\033[0m"
         echo -e " 定时任务   : \033[33m$(crontab -l 2>/dev/null | grep "$0" > /dev/null && echo "已开启" || echo "未开启")\033[0m"
         echo -e "=========================================="
         echo " 1. 🚀 立即执行一次备份"
-        echo " 2. 🪣  配置 S3 储存桶参数 (Rclone)"
-        echo " 3. 🔍 测试 S3 储存桶连接状态"
+        echo " 2. 🪣  配置 S3 存储桶参数 (Rclone)"
+        echo " 3. 🔍 测试 S3 存储桶连接状态"
         echo " 4. 🤖 配置 Telegram Bot 通知"
         echo " 5. 📅 设置旧备份保留天数"
         echo " 6. ⏰ 开启/刷新自动备份定时任务"
