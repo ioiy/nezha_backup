@@ -4,7 +4,7 @@
 # 哪吒面板 V2 自动备份与管理脚本
 # ==========================================
 
-CURRENT_VERSION="1.0.7"
+CURRENT_VERSION="1.0.9"
 CONFIG_FILE="/root/.nezha_backup_config"
 UPDATE_URL="https://raw.githubusercontent.com/ioiy/nezha_backup/main/bf.sh"
 
@@ -74,11 +74,48 @@ send_tg() {
 
 # 核心备份逻辑 (Cron 调用的部分)
 run_backup() {
+    local run_mode="$1"
     source "$CONFIG_FILE"
     
     if [ -z "$S3_BUCKET" ]; then
         send_tg "FAIL" "未配置 S3 存储桶名称，请进入控制面板配置。"
         exit 1
+    fi
+
+    # 如果是 Cron 定时后台运行，启用极致静默低优先级模式 (Feature 3)
+    if [ "$run_mode" == "cron" ]; then
+        # 降低当前脚本及子进程(tar/rclone)的 CPU 调度优先级
+        renice -n 19 -p $$ >/dev/null 2>&1
+        # 降低磁盘 IO 优先级
+        if command -v ionice >/dev/null 2>&1; then
+            ionice -c 2 -n 7 -p $$ >/dev/null 2>&1
+        fi
+    fi
+
+    # --- 预检机制: 磁盘空间 (Feature 2) ---
+    if [ "$run_mode" != "cron" ]; then echo "正在进行磁盘空间预检..."; fi
+    local NEZHA_SIZE_KB=$(du -sk /opt/nezha 2>/dev/null | awk '{print $1}')
+    local AVAIL_SPACE_KB=$(df -k / | awk 'NR==2 {print $4}')
+    local REQ_SPACE_KB=$((NEZHA_SIZE_KB + 102400)) # 加上 100MB 缓冲
+    
+    if [ -n "$AVAIL_SPACE_KB" ] && [ -n "$NEZHA_SIZE_KB" ] && [ "$AVAIL_SPACE_KB" -lt "$REQ_SPACE_KB" ]; then
+        send_tg "FAIL" "服务器磁盘空间严重不足！打包需要约 $((REQ_SPACE_KB/1024))MB，当前仅剩 $((AVAIL_SPACE_KB/1024))MB。为防止宕机，已终止备份。"
+        [ "$run_mode" != "cron" ] && echo -e "\033[31m[错误]\033[0m 磁盘可用空间不足以完成打包！"
+        exit 1
+    fi
+
+    # --- 预检机制: 数据库完整性 (Feature 1) ---
+    local DB_PATH="/opt/nezha/dashboard/data/sqlite.db"
+    if [ -f "$DB_PATH" ]; then
+        if command -v sqlite3 >/dev/null 2>&1; then
+            if [ "$run_mode" != "cron" ]; then echo "正在进行数据库完整性校验..."; fi
+            local DB_CHECK=$(sqlite3 "$DB_PATH" "PRAGMA integrity_check;" 2>&1)
+            if [[ "$DB_CHECK" != *"ok"* ]]; then
+                send_tg "FAIL" "数据库完整性预检失败！数据可能已损坏，已终止备份以防覆盖云端正常存档。诊断信息: $DB_CHECK"
+                [ "$run_mode" != "cron" ] && echo -e "\033[31m[错误]\033[0m 数据库完整性校验未通过: $DB_CHECK"
+                exit 1
+            fi
+        fi
     fi
 
     # 修改日期格式以便于过滤每月1号
@@ -87,7 +124,7 @@ run_backup() {
     # 1. 打包数据与加密
     if [ -n "$ENCRYPT_PASS" ]; then
         BACKUP_FILE="/root/nezha_backup_${DATE_STR}.tar.gz.enc"
-        echo "开始打包并加密 /opt/nezha 目录..."
+        [ "$run_mode" != "cron" ] && echo "开始打包并加密 /opt/nezha 目录..."
         tar -czf - /opt/nezha 2>/dev/null | openssl enc -aes-256-cbc -pbkdf2 -salt -k "$ENCRYPT_PASS" > "$BACKUP_FILE"
         if [ $? -ne 0 ]; then
             send_tg "FAIL" "打包并加密目录失败，请检查磁盘空间或 openssl 依赖。"
@@ -95,7 +132,7 @@ run_backup() {
         fi
     else
         BACKUP_FILE="/root/nezha_backup_${DATE_STR}.tar.gz"
-        echo "开始打包 /opt/nezha 目录..."
+        [ "$run_mode" != "cron" ] && echo "开始打包 /opt/nezha 目录..."
         tar -czf "$BACKUP_FILE" /opt/nezha > /dev/null 2>&1
         if [ $? -ne 0 ]; then
             send_tg "FAIL" "打包目录失败，请检查磁盘空间或权限。"
@@ -105,11 +142,11 @@ run_backup() {
     
     FILE_SIZE=$(du -sh "$BACKUP_FILE" | awk '{print $1}')
 
-    # 2. 上传到 S3 (加入了极低内存参数、交互模式实时进度条、强制不检查Bucket)
-    echo "开始上传至 S3..."
+    # 2. 上传到 S3
+    [ "$run_mode" != "cron" ] && echo "开始上传至 S3..."
     local RCLONE_OPTS="--transfers 1 --buffer-size 0 --use-mmap --s3-no-check-bucket"
-    if [ -t 0 ]; then
-        RCLONE_OPTS="$RCLONE_OPTS -P" # 只有手动运行时才显示上传进度
+    if [ "$run_mode" != "cron" ] && [ -t 0 ]; then
+        RCLONE_OPTS="$RCLONE_OPTS -P" # 只有手动运行才显示上传进度
     fi
     rclone copy "$BACKUP_FILE" "nezha_s3:${S3_BUCKET}/nezha_backups/" $RCLONE_OPTS
     if [ $? -ne 0 ]; then
@@ -119,7 +156,7 @@ run_backup() {
     fi
 
     # 3. 清理旧备份
-    echo "清理 ${RETENTION_DAYS} 天前的旧备份..."
+    [ "$run_mode" != "cron" ] && echo "清理 ${RETENTION_DAYS} 天前的旧备份..."
     local DELETE_OPTS="--min-age ${RETENTION_DAYS}d --s3-no-check-bucket"
     if [ "$RETAIN_FIRST_DAY" == "true" ]; then
         # 排除包含 -01_ 的文件，实现每月1号长效保留
@@ -135,8 +172,8 @@ run_backup() {
     
     send_tg "SUCCESS" "$notify_msg"
     
-    # 如果是手动运行，稍微停留一下
-    if [ -t 0 ]; then
+    # 手动运行结束提示
+    if [ "$run_mode" != "cron" ] && [ -t 0 ]; then
         echo -e "\n\033[32m[OK]\033[0m 备份流程执行完毕！"
         read -n 1 -s -r -p "按任意键返回主菜单..."
     fi
@@ -197,25 +234,78 @@ quick_check_s3() {
     fi
 }
 
-# 检测 S3 连接状态
-check_s3() {
-    clear
-    echo "=========================================="
-    echo "          测试 S3 存储桶连接状态          "
-    echo "=========================================="
+# 交互式管理 S3 中的备份 (Feature 7)
+manage_backups() {
     if [ -z "$S3_BUCKET" ]; then
+        clear
+        echo "=========================================="
+        echo "        可视化 S3 备份管理中心            "
+        echo "=========================================="
         echo -e "\033[31m[错误]\033[0m 尚未配置 S3 存储桶名称，请先配置！"
-    else
-        echo "正在尝试连接并获取 S3 数据 (超时 10 秒)..."
-        # 使用 lsf 列出目录代替 mkdir，避免触发 bucket 创建权限问题
-        if rclone lsf "nezha_s3:${S3_BUCKET}" --s3-no-check-bucket --contimeout 10s --retries 1 > /dev/null 2>&1; then
-            echo -e "\n\033[32m[成功]\033[0m 连接正常！可以顺利访问 ${S3_BUCKET} 桶。"
-        else
-            echo -e "\n\033[31m[失败]\033[0m 连接异常！请检查：\n1. 访问密钥或 Endpoint 是否填写错误\n2. 存储桶 ${S3_BUCKET} 是否存在\n3. 机器网络是否通畅"
-        fi
+        echo ""
+        read -n 1 -s -r -p "按任意键返回主菜单..."
+        return
     fi
-    echo ""
-    read -n 1 -s -r -p "按任意键返回主菜单..."
+
+    while true; do
+        clear
+        echo "=========================================="
+        echo "        可视化 S3 备份管理中心            "
+        echo "=========================================="
+        echo -e "正在获取云端备份数据，请稍候...\n"
+        
+        # 将文件列表抓取到 Bash 数组中，按时间倒序
+        FILES=($(rclone lsf "nezha_s3:${S3_BUCKET}/nezha_backups/" --s3-no-check-bucket | grep -E '\.tar\.gz$|\.enc$' | sort -r))
+        
+        if [ ${#FILES[@]} -eq 0 ]; then
+            echo -e "\033[33m[提示]\033[0m 当前存储桶中还没有任何备份文件。"
+            echo ""
+            read -n 1 -s -r -p "按任意键返回主菜单..."
+            break
+        fi
+        
+        # 打印带序号的列表
+        for i in "${!FILES[@]}"; do
+            echo -e " [\033[36m$i\033[0m] ${FILES[$i]}"
+        done
+        
+        echo -e "\n------------------------------------------"
+        echo "操作说明："
+        echo " - 输入数字 (如 0)     可 🗑️ 永久删除对应备份"
+        echo " - 输入 r+数字 (如 r0) 可 🚑 定点恢复对应备份"
+        echo " - 输入 q 可以退出管理中心返回主菜单"
+        echo "------------------------------------------"
+        read -p "请输入操作指令: " action
+        
+        if [ "$action" == "q" ] || [ "$action" == "Q" ]; then
+            break
+        elif [[ "$action" =~ ^r([0-9]+)$ ]]; then
+            # 恢复指定序号
+            local idx="${BASH_REMATCH[1]}"
+            if [ -n "${FILES[$idx]}" ]; then
+                restore_backup "${FILES[$idx]}"
+                break
+            else
+                echo -e "\033[31m[错误]\033[0m 无效的序号！" && sleep 1
+            fi
+        elif [[ "$action" =~ ^[0-9]+$ ]]; then
+            # 删除指定序号
+            local idx="$action"
+            if [ -n "${FILES[$idx]}" ]; then
+                read -p "⚠️ 确定要永久删除 ${FILES[$idx]} 吗？[y/N]: " del_confirm
+                if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
+                    echo "正在向 S3 发送删除请求..."
+                    rclone deletefile "nezha_s3:${S3_BUCKET}/nezha_backups/${FILES[$idx]}" --s3-no-check-bucket
+                    echo -e "\033[32m[成功]\033[0m 备份文件已删除！"
+                    sleep 1
+                fi
+            else
+                echo -e "\033[31m[错误]\033[0m 无效的序号！" && sleep 1
+            fi
+        else
+            echo -e "\033[31m[错误]\033[0m 未知指令，请重新输入！" && sleep 1
+        fi
+    done
     quick_check_s3
 }
 
@@ -290,6 +380,7 @@ setup_cron() {
     read -p "请选择 [1-5]: " cron_choice
     
     SCRIPT_PATH=$(readlink -f "$0")
+    # 定时任务执行时，传入 cron 参数激活静默模式
     CRON_CMD="$SCRIPT_PATH cron > /dev/null 2>&1"
     
     if [ "$cron_choice" == "5" ]; then
@@ -391,42 +482,45 @@ update_script() {
     fi
 }
 
-# 从 S3 一键恢复最新备份
+# 从 S3 恢复指定或最新备份
 restore_backup() {
+    local target_file="$1"
     clear
     echo "=========================================="
-    echo "          从 S3 恢复最新备份数据          "
+    echo "          从 S3 恢复备份数据              "
     echo "=========================================="
     if [ -z "$S3_BUCKET" ]; then
         echo -e "\033[31m[错误]\033[0m 尚未配置 S3 存储桶，请先配置！"
         sleep 2; return
     fi
 
-    echo "正在连接 S3 获取最新的备份列表..."
-    # 同时兼容读取普通备份(.tar.gz)和加密备份(.enc)
-    LATEST_BACKUP=$(rclone lsf "nezha_s3:${S3_BUCKET}/nezha_backups/" --s3-no-check-bucket | grep -E '\.tar\.gz$|\.enc$' | sort -r | head -n 1)
-    
-    if [ -z "$LATEST_BACKUP" ]; then
-        echo -e "\n\033[31m[失败]\033[0m 未在 S3 存储桶中找到任何备份文件！"
-        read -n 1 -s -r -p "按任意键返回主菜单..."
-        return
+    # 如果没有通过参数传递文件，则自动寻找最新的
+    if [ -z "$target_file" ]; then
+        echo "正在连接 S3 获取最新的备份列表..."
+        # 同时兼容读取普通备份(.tar.gz)和加密备份(.enc)
+        target_file=$(rclone lsf "nezha_s3:${S3_BUCKET}/nezha_backups/" --s3-no-check-bucket | grep -E '\.tar\.gz$|\.enc$' | sort -r | head -n 1)
+        
+        if [ -z "$target_file" ]; then
+            echo -e "\n\033[31m[失败]\033[0m 未在 S3 存储桶中找到任何备份文件！"
+            read -n 1 -s -r -p "按任意键返回主菜单..."
+            return
+        fi
     fi
 
-    echo -e "\n找到最新备份: \033[32m${LATEST_BACKUP}\033[0m"
+    echo -e "\n准备恢复备份: \033[32m${target_file}\033[0m"
     echo -e "\033[31m⚠️ 警告：恢复操作将停止面板服务，并覆盖当前的 /opt/nezha 数据！\033[0m"
     read -p "确定要继续吗？[y/N]: " confirm_restore
     
     if [[ "$confirm_restore" =~ ^[Yy]$ ]]; then
         echo -e "\n1. 正在从 S3 下载备份文件 (显示实时进度)..."
-        # 强制带 -P 显示下载进度
-        rclone copy "nezha_s3:${S3_BUCKET}/nezha_backups/${LATEST_BACKUP}" /tmp/ -P --transfers 1 --buffer-size 0 --use-mmap --s3-no-check-bucket
+        rclone copy "nezha_s3:${S3_BUCKET}/nezha_backups/${target_file}" /tmp/ -P --transfers 1 --buffer-size 0 --use-mmap --s3-no-check-bucket
         
         if [ $? -eq 0 ]; then
             echo -e "\n2. 下载成功，正在停止哪吒面板服务..."
             systemctl stop nezha-dashboard 2>/dev/null
             
             # 判断是否是加密备份
-            if [[ "$LATEST_BACKUP" == *.enc ]]; then
+            if [[ "$target_file" == *.enc ]]; then
                 if [ -z "$ENCRYPT_PASS" ]; then
                     read -s -p "🔒 此备份已加密，请输入解密密码: " input_pass
                     echo ""
@@ -435,28 +529,28 @@ restore_backup() {
                     echo "🔒 检测到预设了加密密码，正在自动尝试解密..."
                 fi
                 echo "3. 正在解密并解压数据..."
-                if ! openssl enc -d -aes-256-cbc -pbkdf2 -salt -k "$input_pass" -in "/tmp/${LATEST_BACKUP}" | tar -xz -C /; then
+                if ! openssl enc -d -aes-256-cbc -pbkdf2 -salt -k "$input_pass" -in "/tmp/${target_file}" | tar -xz -C /; then
                     echo -e "\n\033[31m[错误]\033[0m 解密失败！密码错误或文件已损坏。"
                     systemctl restart nezha-dashboard 2>/dev/null
-                    rm -f "/tmp/${LATEST_BACKUP}"
+                    rm -f "/tmp/${target_file}"
                     read -n 1 -s -r -p "按任意键返回主菜单..."
                     return
                 fi
             else
                 echo "3. 正在解压并覆盖数据..."
-                tar -xzf "/tmp/${LATEST_BACKUP}" -C /
+                tar -xzf "/tmp/${target_file}" -C /
             fi
             
             echo "4. 正在重启面板服务..."
             systemctl restart nezha-dashboard 2>/dev/null
             
             echo "5. 正在清理临时文件..."
-            rm -f "/tmp/${LATEST_BACKUP}"
+            rm -f "/tmp/${target_file}"
             
             echo -e "\n\033[32m[成功]\033[0m 数据恢复完毕，哪吒面板已重新启动！"
         else
             echo -e "\n\033[31m[错误]\033[0m 下载备份文件失败，请检查网络或配置。"
-            rm -f "/tmp/${LATEST_BACKUP}"
+            rm -f "/tmp/${target_file}"
         fi
     else
         echo -e "\n已取消恢复操作。"
@@ -484,7 +578,7 @@ show_menu() {
         echo -e "=========================================="
         echo " 1. 🚀 立即执行一次备份"
         echo " 2. 🪣  配置 S3 存储桶参数 (Rclone)"
-        echo " 3. 🔍 测试 S3 存储桶连接状态"
+        echo " 3. 🗂️  可视化管理 (查看/删除/定点恢复)"
         echo " 4. 🤖 配置 Telegram Bot 通知"
         echo " 5. 📅 设置旧备份保留天数与长效白名单"
         echo " 6. ⏰ 配置自动备份定时任务"
@@ -496,9 +590,9 @@ show_menu() {
         read -p "请输入选项 [0-9]: " choice
         
         case $choice in
-            1) run_backup ;;
+            1) run_backup "manual" ;;
             2) setup_s3 ;;
-            3) check_s3 ;;
+            3) manage_backups ;;
             4) setup_tg ;;
             5) setup_retention ;;
             6) setup_cron ;;
@@ -514,7 +608,7 @@ show_menu() {
 # 脚本入口点判断
 if [ "$1" == "cron" ]; then
     init_config
-    run_backup
+    run_backup "cron"
 else
     show_menu
 fi
