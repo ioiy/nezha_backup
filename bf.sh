@@ -4,8 +4,8 @@
 # 哪吒面板 V2 自动备份与管理脚本
 # ==========================================
 
+CURRENT_VERSION="1.0.0"
 CONFIG_FILE="/root/.nezha_backup_config"
-# GitHub Raw 地址 (用于一键更新脚本)
 UPDATE_URL="https://raw.githubusercontent.com/ioiy/nezha_backup/main/bf.sh"
 
 # 默认配置初始化
@@ -81,7 +81,7 @@ run_backup() {
     
     FILE_SIZE=$(du -sh "$BACKUP_FILE" | awk '{print $1}')
 
-    # 2. 上传到 S3
+    # 2. 上传到 S3 (加入了极低内存参数)
     echo "开始上传至 S3..."
     rclone copy "$BACKUP_FILE" "nezha_s3:${S3_BUCKET}/nezha_backups/" --transfers 1 --buffer-size 0 --use-mmap > /dev/null 2>&1
     if [ $? -ne 0 ]; then
@@ -95,7 +95,7 @@ run_backup() {
     rclone delete "nezha_s3:${S3_BUCKET}/nezha_backups/" --min-age "${RETENTION_DAYS}d" > /dev/null 2>&1
 
     # 4. 扫尾与通知
-    rm -f "$BACKUP_FILE" # 删除本地压缩包释放空间
+    rm -f "$BACKUP_FILE"
     send_tg "SUCCESS" "数据已成功打包上传！%0A📦 文件大小: ${FILE_SIZE}%0A🧹 已清理 ${RETENTION_DAYS} 天前的旧文件。"
     
     # 如果是手动运行，稍微停留一下
@@ -107,7 +107,6 @@ run_backup() {
 
 # ----------------- UI 交互部分 -----------------
 
-# 安装与配置 Rclone
 setup_s3() {
     clear
     echo "=========================================="
@@ -125,7 +124,6 @@ setup_s3() {
     read -p "请输入 Secret Key (SK): " s3_sk
     read -p "请输入你要储存的 Bucket (桶) 名称: " S3_BUCKET
 
-    # 写入 rclone 配置文件
     mkdir -p /root/.config/rclone
     cat > /root/.config/rclone/rclone.conf << EOF
 [nezha_s3]
@@ -140,6 +138,27 @@ EOF
     save_config
     echo -e "\n\033[32m[OK]\033[0m Rclone 和 S3 配置已生成！名称为 [nezha_s3]"
     sleep 2
+}
+
+# 检测 S3 连接状态
+check_s3() {
+    clear
+    echo "=========================================="
+    echo "          测试 S3 储存桶连接状态          "
+    echo "=========================================="
+    if [ -z "$S3_BUCKET" ]; then
+        echo -e "\033[31m[错误]\033[0m 尚未配置 S3 储存桶名称，请先配置！"
+    else
+        echo "正在尝试连接并获取 S3 数据 (超时 10 秒)..."
+        # 尝试创建一个测试目录，或者列出文件，以验证权限和连通性
+        if rclone mkdir "nezha_s3:${S3_BUCKET}/nezha_backups" --contimeout 10s --retries 1 > /dev/null 2>&1; then
+            echo -e "\n\033[32m[成功]\033[0m 连接正常！可以顺利访问 ${S3_BUCKET} 桶。"
+        else
+            echo -e "\n\033[31m[失败]\033[0m 连接异常！请检查：\n1. API / AK / SK 是否填写错误\n2. 储存桶 ${S3_BUCKET} 是否存在\n3. 机器网络是否通畅"
+        fi
+    fi
+    echo ""
+    read -n 1 -s -r -p "按任意键返回主菜单..."
 }
 
 setup_tg() {
@@ -200,33 +219,54 @@ setup_cron() {
     sleep 2
 }
 
-# 在线更新脚本
+# 在线更新脚本 (带版本比对和确认)
 update_script() {
     clear
     echo "=========================================="
-    echo "            正在检查并更新脚本            "
+    echo "            检查脚本更新版本              "
     echo "=========================================="
     
     SCRIPT_PATH=$(readlink -f "$0")
     TMP_FILE="/tmp/nezha_backup_update.sh"
 
-    echo -e "正在从 GitHub 获取最新版本..."
-    # 下载到临时文件
+    echo -e "正在从 GitHub 获取最新版本信息..."
     curl -L -s "$UPDATE_URL" -o "$TMP_FILE"
 
-    # 检查下载是否成功，并验证文件完整性（简单的特征词匹配）
-    if [ $? -eq 0 ] && grep -q "哪吒面板 V2" "$TMP_FILE"; then
-        # 覆盖现有脚本
-        cat "$TMP_FILE" > "$SCRIPT_PATH"
-        chmod +x "$SCRIPT_PATH"
-        rm -f "$TMP_FILE"
-        echo -e "\n\033[32m[OK]\033[0m 脚本更新成功！"
-        echo -e "请按任意键重启面板..."
-        read -n 1 -s -r
-        # 使用新脚本替换当前进程，实现无缝重启
-        exec "$SCRIPT_PATH"
+    # 验证下载是否成功且包含版本号变量
+    if [ $? -eq 0 ] && grep -q "^CURRENT_VERSION=" "$TMP_FILE"; then
+        # 提取临时文件中的新版本号
+        NEW_VERSION=$(grep "^CURRENT_VERSION=" "$TMP_FILE" | cut -d'"' -f2 | head -n 1)
+        
+        echo -e "\n当前版本: \033[33mv${CURRENT_VERSION}\033[0m"
+        echo -e "最新版本: \033[32mv${NEW_VERSION}\033[0m"
+        
+        if [ "$CURRENT_VERSION" == "$NEW_VERSION" ]; then
+            echo -e "\n当前已是最新版本，无需更新！"
+            rm -f "$TMP_FILE"
+            read -n 1 -s -r -p "按任意键返回主菜单..."
+            return
+        fi
+
+        echo ""
+        read -p "发现新版本，是否立即覆盖更新？[Y/n]: " confirm_update
+        case "$confirm_update" in
+            [yY][eE][sS]|[yY]|"")
+                cat "$TMP_FILE" > "$SCRIPT_PATH"
+                chmod +x "$SCRIPT_PATH"
+                rm -f "$TMP_FILE"
+                echo -e "\n\033[32m[OK]\033[0m 脚本更新成功！"
+                echo -e "请按任意键重启面板..."
+                read -n 1 -s -r
+                exec "$SCRIPT_PATH"
+                ;;
+            *)
+                echo -e "\n已取消更新。"
+                rm -f "$TMP_FILE"
+                sleep 2
+                ;;
+        esac
     else
-        echo -e "\n\033[31m[错误]\033[0m 下载失败或文件不完整，更新已取消。"
+        echo -e "\n\033[31m[错误]\033[0m 下载失败或文件不完整，无法获取版本信息。"
         echo -e "请检查服务器网络是否能正常访问 GitHub Raw。"
         rm -f "$TMP_FILE"
         sleep 3
@@ -239,7 +279,7 @@ show_menu() {
     while true; do
         clear
         echo -e "=========================================="
-        echo -e "      \033[36m哪吒面板 V2 数据备份控制台\033[0m          "
+        echo -e "   \033[36m哪吒面板 V2 数据备份控制台 \033[32m[v${CURRENT_VERSION}]\033[0m"
         echo -e "=========================================="
         echo -e " S3 储存桶  : \033[33m${S3_BUCKET:-未配置}\033[0m"
         echo -e " 保留天数   : \033[33m${RETENTION_DAYS} 天\033[0m"
@@ -248,21 +288,23 @@ show_menu() {
         echo -e "=========================================="
         echo " 1. 🚀 立即执行一次备份"
         echo " 2. 🪣  配置 S3 储存桶参数 (Rclone)"
-        echo " 3. 🤖 配置 Telegram Bot 通知"
-        echo " 4. 📅 设置旧备份保留天数"
-        echo " 5. ⏰ 开启/刷新自动备份定时任务"
-        echo " 6. 🔄 从 GitHub 更新本脚本"
+        echo " 3. 🔍 测试 S3 储存桶连接状态"
+        echo " 4. 🤖 配置 Telegram Bot 通知"
+        echo " 5. 📅 设置旧备份保留天数"
+        echo " 6. ⏰ 开启/刷新自动备份定时任务"
+        echo " 7. 🔄 检查并从 GitHub 更新脚本"
         echo " 0. 退出面板"
         echo "=========================================="
-        read -p "请输入选项 [0-6]: " choice
+        read -p "请输入选项 [0-7]: " choice
         
         case $choice in
             1) run_backup ;;
             2) setup_s3 ;;
-            3) setup_tg ;;
-            4) setup_retention ;;
-            5) setup_cron ;;
-            6) update_script ;;
+            3) check_s3 ;;
+            4) setup_tg ;;
+            5) setup_retention ;;
+            6) setup_cron ;;
+            7) update_script ;;
             0) exit 0 ;;
             *) echo "无效选项，请重新输入" && sleep 1 ;;
         esac
@@ -271,10 +313,8 @@ show_menu() {
 
 # 脚本入口点判断
 if [ "$1" == "cron" ]; then
-    # 如果带有 cron 参数，说明是定时任务在后台静默运行
     init_config
     run_backup
 else
-    # 否则弹出交互式菜单
     show_menu
 fi
