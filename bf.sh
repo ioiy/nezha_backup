@@ -4,7 +4,7 @@
 # 哪吒面板 V2 自动备份与管理脚本
 # ==========================================
 
-CURRENT_VERSION="1.0.1"
+CURRENT_VERSION="1.0.3"
 CONFIG_FILE="/root/.nezha_backup_config"
 UPDATE_URL="https://raw.githubusercontent.com/ioiy/nezha_backup/main/bf.sh"
 
@@ -138,6 +138,7 @@ secret_access_key = ${s3_sk}
 endpoint = ${s3_endpoint}
 region = ${s3_region}
 force_path_style = true
+no_check_bucket = true
 EOF
 
     save_config
@@ -155,8 +156,8 @@ check_s3() {
         echo -e "\033[31m[错误]\033[0m 尚未配置 S3 存储桶名称，请先配置！"
     else
         echo "正在尝试连接并获取 S3 数据 (超时 10 秒)..."
-        # 尝试创建一个测试目录，或者列出文件，以验证权限和连通性
-        if rclone mkdir "nezha_s3:${S3_BUCKET}/nezha_backups" --contimeout 10s --retries 1 > /dev/null 2>&1; then
+        # 使用 lsf 列出目录代替 mkdir，避免触发 bucket 创建权限问题
+        if rclone lsf "nezha_s3:${S3_BUCKET}" --contimeout 10s --retries 1 > /dev/null 2>&1; then
             echo -e "\n\033[32m[成功]\033[0m 连接正常！可以顺利访问 ${S3_BUCKET} 桶。"
         else
             echo -e "\n\033[31m[失败]\033[0m 连接异常！请检查：\n1. 访问密钥或 Endpoint 是否填写错误\n2. 存储桶 ${S3_BUCKET} 是否存在\n3. 机器网络是否通畅"
@@ -235,7 +236,8 @@ update_script() {
     TMP_FILE="/tmp/nezha_backup_update.sh"
 
     echo -e "正在从 GitHub 获取最新版本信息..."
-    curl -L -s "$UPDATE_URL" -o "$TMP_FILE"
+    # 核心修复点：添加时间戳 ?t=$(date +%s) 来强制绕过 GitHub Raw CDN 缓存
+    curl -L -s "${UPDATE_URL}?t=$(date +%s)" -o "$TMP_FILE"
 
     # 验证下载是否成功且包含版本号变量
     if [ $? -eq 0 ] && grep -q "^CURRENT_VERSION=" "$TMP_FILE"; then
