@@ -83,7 +83,7 @@ run_backup() {
 
     # 2. 上传到 S3
     echo "开始上传至 S3..."
-    rclone copy "$BACKUP_FILE" "nezha_s3:${S3_BUCKET}/nezha_backups/" > /dev/null 2>&1
+    rclone copy "$BACKUP_FILE" "nezha_s3:${S3_BUCKET}/nezha_backups/" --transfers 1 --buffer-size 0 --use-mmap > /dev/null 2>&1
     if [ $? -ne 0 ]; then
         send_tg "FAIL" "上传到 S3 失败，请检查 Rclone 配置和网络连通性。"
         rm -f "$BACKUP_FILE"
