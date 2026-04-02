@@ -4,7 +4,7 @@
 # 哪吒面板 V2 自动备份与管理脚本
 # ==========================================
 
-CURRENT_VERSION="1.0.9"
+CURRENT_VERSION="1.1.0"
 CONFIG_FILE="/root/.nezha_backup_config"
 UPDATE_URL="https://raw.githubusercontent.com/ioiy/nezha_backup/main/bf.sh"
 
@@ -273,11 +273,12 @@ manage_backups() {
         echo "操作说明："
         echo " - 输入数字 (如 0)     可 🗑️ 永久删除对应备份"
         echo " - 输入 r+数字 (如 r0) 可 🚑 定点恢复对应备份"
-        echo " - 输入 q 可以退出管理中心返回主菜单"
+        echo " - 直接回车 或 输入 q  可退出管理中心返回主菜单"
         echo "------------------------------------------"
         read -p "请输入操作指令: " action
         
-        if [ "$action" == "q" ] || [ "$action" == "Q" ]; then
+        # 判断如果为空（直接回车）或者输入 q，则退出循环
+        if [ -z "$action" ] || [ "$action" == "q" ] || [ "$action" == "Q" ]; then
             break
         elif [[ "$action" =~ ^r([0-9]+)$ ]]; then
             # 恢复指定序号
