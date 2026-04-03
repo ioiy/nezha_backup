@@ -2,9 +2,13 @@
 
 # ==========================================
 # 哪吒面板 V2 自动备份与管理脚本
+# (已优化：增加网络重试机制与北京时间同步)
 # ==========================================
 
-CURRENT_VERSION="1.1.0"
+# 强制本脚本运行环境为北京时间 (东八区)
+export TZ='Asia/Shanghai'
+
+CURRENT_VERSION="1.2.0"
 CONFIG_FILE="/root/.nezha_backup_config"
 UPDATE_URL="https://raw.githubusercontent.com/ioiy/nezha_backup/main/bf.sh"
 
@@ -44,6 +48,32 @@ EOF
     sleep 1
 }
 
+# ----------------- 核心重试机制 -----------------
+# 用法: execute_with_retry <最大重试次数> <重试间隔秒数> <具体命令...>
+execute_with_retry() {
+    local max_attempts=$1
+    local interval=$2
+    shift 2
+    local attempt=1
+    local exit_code=0
+    
+    while [ $attempt -le $max_attempts ]; do
+        "$@"
+        exit_code=$?
+        if [ $exit_code -eq 0 ]; then
+            return 0
+        fi
+        
+        # 仅在非 cron 模式下打印重试警告到终端，避免 cron 产生多余邮件/日志
+        if [ "$run_mode" != "cron" ]; then
+            echo -e "\033[33m[警告]\033[0m 命令执行失败 (退出码: $exit_code)，将在 $interval 秒后进行第 $attempt/$max_attempts 次重试..."
+        fi
+        sleep $interval
+        attempt=$((attempt + 1))
+    done
+    return $exit_code
+}
+
 # TG 通知发送函数
 send_tg() {
     local status=$1
@@ -54,7 +84,7 @@ send_tg() {
     if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then return; fi
 
     local current_time=$(date "+%Y-%m-%d %H:%M:%S")
-    local text="🤖 <b>哪吒面板备份通知</b>%0A⏰ 时间: ${current_time}%0A"
+    local text="🤖 <b>哪吒面板备份通知</b>%0A⏰ 北京时间: ${current_time}%0A"
     
     if [ "$status" == "SUCCESS" ]; then
         # 获取服务器状态
@@ -118,7 +148,7 @@ run_backup() {
         fi
     fi
 
-    # 修改日期格式以便于过滤每月1号
+    # 修改日期格式以便于过滤每月1号 (北京时间)
     DATE_STR=$(date +%Y-%m-%d_%H%M)
     
     # 1. 打包数据与加密
@@ -142,27 +172,30 @@ run_backup() {
     
     FILE_SIZE=$(du -sh "$BACKUP_FILE" | awk '{print $1}')
 
-    # 2. 上传到 S3
-    [ "$run_mode" != "cron" ] && echo "开始上传至 S3..."
+    # 2. 上传到 S3 (引入重试机制)
+    [ "$run_mode" != "cron" ] && echo "开始上传至 S3 (启用重试机制)..."
     local RCLONE_OPTS="--transfers 1 --buffer-size 0 --use-mmap --s3-no-check-bucket"
     if [ "$run_mode" != "cron" ] && [ -t 0 ]; then
         RCLONE_OPTS="$RCLONE_OPTS -P" # 只有手动运行才显示上传进度
     fi
-    rclone copy "$BACKUP_FILE" "nezha_s3:${S3_BUCKET}/nezha_backups/" $RCLONE_OPTS
+    
+    # 执行上传：最多重试 3 次，每次间隔 10 秒
+    execute_with_retry 3 10 rclone copy "$BACKUP_FILE" "nezha_s3:${S3_BUCKET}/nezha_backups/" $RCLONE_OPTS
     if [ $? -ne 0 ]; then
-        send_tg "FAIL" "上传到 S3 失败，请检查 Rclone 配置和网络连通性。"
+        send_tg "FAIL" "经过 3 次重试，上传到 S3 依然失败，请检查 Rclone 配置和网络连通性。"
         rm -f "$BACKUP_FILE"
         exit 1
     fi
 
-    # 3. 清理旧备份
+    # 3. 清理旧备份 (引入重试机制)
     [ "$run_mode" != "cron" ] && echo "清理 ${RETENTION_DAYS} 天前的旧备份..."
     local DELETE_OPTS="--min-age ${RETENTION_DAYS}d --s3-no-check-bucket"
     if [ "$RETAIN_FIRST_DAY" == "true" ]; then
         # 排除包含 -01_ 的文件，实现每月1号长效保留
         DELETE_OPTS="$DELETE_OPTS --exclude *_*-01_*.*"
     fi
-    rclone delete "nezha_s3:${S3_BUCKET}/nezha_backups/" $DELETE_OPTS > /dev/null 2>&1
+    # 清理操作最多重试 3 次
+    execute_with_retry 3 10 rclone delete "nezha_s3:${S3_BUCKET}/nezha_backups/" $DELETE_OPTS > /dev/null 2>&1
 
     # 4. 扫尾与通知
     rm -f "$BACKUP_FILE"
@@ -226,7 +259,8 @@ quick_check_s3() {
     if [ -z "$S3_BUCKET" ]; then
         S3_CONN_STATUS="\033[31m[未配置]\033[0m"
     else
-        if rclone lsf "nezha_s3:${S3_BUCKET}" --s3-no-check-bucket --contimeout 5s --retries 1 > /dev/null 2>&1; then
+        # 检测连接也使用重试，避免偶尔的网络抖动造成误判
+        if execute_with_retry 2 3 rclone lsf "nezha_s3:${S3_BUCKET}" --s3-no-check-bucket --contimeout 5s --retries 1 > /dev/null 2>&1; then
             S3_CONN_STATUS="\033[32m[✅ 正常]\033[0m"
         else
             S3_CONN_STATUS="\033[31m[❌ 异常]\033[0m"
@@ -296,8 +330,12 @@ manage_backups() {
                 read -p "⚠️ 确定要永久删除 ${FILES[$idx]} 吗？[y/N]: " del_confirm
                 if [[ "$del_confirm" =~ ^[Yy]$ ]]; then
                     echo "正在向 S3 发送删除请求..."
-                    rclone deletefile "nezha_s3:${S3_BUCKET}/nezha_backups/${FILES[$idx]}" --s3-no-check-bucket
-                    echo -e "\033[32m[成功]\033[0m 备份文件已删除！"
+                    execute_with_retry 3 5 rclone deletefile "nezha_s3:${S3_BUCKET}/nezha_backups/${FILES[$idx]}" --s3-no-check-bucket
+                    if [ $? -eq 0 ]; then
+                        echo -e "\033[32m[成功]\033[0m 备份文件已删除！"
+                    else
+                        echo -e "\033[31m[错误]\033[0m 删除失败，请重试。"
+                    fi
                     sleep 1
                 fi
             else
@@ -369,13 +407,23 @@ setup_retention() {
 setup_cron() {
     clear
     echo "=========================================="
-    echo "             配置定时自动备份             "
+    echo "             配置自动备份定时任务             "
     echo "=========================================="
+    
+    # 配置 Cron 时，尝试同步系统时区为北京时间，以保证 Cron 执行准确
+    echo "正在确保系统时区为北京时间以保障定时执行精准..."
+    if command -v timedatectl >/dev/null 2>&1; then
+        timedatectl set-timezone Asia/Shanghai 2>/dev/null
+    else
+        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime 2>/dev/null
+    fi
+    echo -e "当前服务器系统时间: \033[36m$(date "+%Y-%m-%d %H:%M:%S")\033[0m"
+    echo "------------------------------------------"
     echo -e "当前定时规则: \033[33m${CRON_RULE}\033[0m"
     echo "------------------------------------------"
-    echo " 1. 每天凌晨 3:00 (0 3 * * *)"
+    echo " 1. 每天凌晨 3:00 (0 3 * * *) [基于北京时间]"
     echo " 2. 每 12 小时一次 (0 */12 * * *)"
-    echo " 3. 每周日凌晨 3:00 (0 3 * * 0)"
+    echo " 3. 每周日凌晨 3:00 (0 3 * * 0) [基于北京时间]"
     echo " 4. 自定义 Cron 表达式"
     echo " 5. 🛑 关闭/删除定时任务"
     read -p "请选择 [1-5]: " cron_choice
@@ -411,7 +459,7 @@ setup_cron() {
 setup_encryption() {
     clear
     echo "=========================================="
-    echo "          🔒 配置备份文件加密             "
+    echo "         🔒 配置备份文件加密              "
     echo "=========================================="
     echo -e "启用加密后，您的数据在 S3 中将以密文形式存放，极大地提升安全性。"
     echo -e "当前状态: $( [ -n "$ENCRYPT_PASS" ] && echo -e "\033[32m已开启\033[0m" || echo -e "\033[31m未开启\033[0m" )\n"
@@ -432,7 +480,7 @@ setup_encryption() {
 update_script() {
     clear
     echo "=========================================="
-    echo "            检查脚本更新版本              "
+    echo "             检查脚本更新版本             "
     echo "=========================================="
     
     SCRIPT_PATH=$(readlink -f "$0")
@@ -498,11 +546,11 @@ restore_backup() {
     # 如果没有通过参数传递文件，则自动寻找最新的
     if [ -z "$target_file" ]; then
         echo "正在连接 S3 获取最新的备份列表..."
-        # 同时兼容读取普通备份(.tar.gz)和加密备份(.enc)
-        target_file=$(rclone lsf "nezha_s3:${S3_BUCKET}/nezha_backups/" --s3-no-check-bucket | grep -E '\.tar\.gz$|\.enc$' | sort -r | head -n 1)
+        # 恢复时获取列表也启用网络重试
+        target_file=$(execute_with_retry 3 5 rclone lsf "nezha_s3:${S3_BUCKET}/nezha_backups/" --s3-no-check-bucket | grep -E '\.tar\.gz$|\.enc$' | sort -r | head -n 1)
         
         if [ -z "$target_file" ]; then
-            echo -e "\n\033[31m[失败]\033[0m 未在 S3 存储桶中找到任何备份文件！"
+            echo -e "\n\033[31m[失败]\033[0m 未在 S3 存储桶中找到任何备份文件或网络连接失败！"
             read -n 1 -s -r -p "按任意键返回主菜单..."
             return
         fi
@@ -513,8 +561,8 @@ restore_backup() {
     read -p "确定要继续吗？[y/N]: " confirm_restore
     
     if [[ "$confirm_restore" =~ ^[Yy]$ ]]; then
-        echo -e "\n1. 正在从 S3 下载备份文件 (显示实时进度)..."
-        rclone copy "nezha_s3:${S3_BUCKET}/nezha_backups/${target_file}" /tmp/ -P --transfers 1 --buffer-size 0 --use-mmap --s3-no-check-bucket
+        echo -e "\n1. 正在从 S3 下载备份文件 (最大重试 3 次，显示实时进度)..."
+        execute_with_retry 3 10 rclone copy "nezha_s3:${S3_BUCKET}/nezha_backups/${target_file}" /tmp/ -P --transfers 1 --buffer-size 0 --use-mmap --s3-no-check-bucket
         
         if [ $? -eq 0 ]; then
             echo -e "\n2. 下载成功，正在停止哪吒面板服务..."
