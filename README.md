@@ -22,4 +22,4 @@
 只需在安装了哪吒面板的服务器上，使用 `root` 用户运行以下一键命令：
 
 ```bash
-curl -O [https://raw.githubusercontent.com/ioiy/nezha_backup/main/bf.sh](https://raw.githubusercontent.com/ioiy/nezha_backup/main/bf.sh) && chmod +x bf.sh && ./bf.sh
+curl -O https://raw.githubusercontent.com/ioiy/nezha_backup/main/bf.sh && chmod +x bf.sh && ./bf.sh
