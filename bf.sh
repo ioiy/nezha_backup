@@ -2,13 +2,13 @@
 
 # ==========================================
 # 哪吒面板 V2 自动备份与管理脚本
-# (已优化：增加网络重试机制与北京时间同步)
+# (已优化：包含配置文件打包与迁移后自动重建 Cron)
 # ==========================================
 
 # 强制本脚本运行环境为北京时间 (东八区)
 export TZ='Asia/Shanghai'
 
-CURRENT_VERSION="1.2.0"
+CURRENT_VERSION="1.3.0"
 CONFIG_FILE="/root/.nezha_backup_config"
 UPDATE_URL="https://raw.githubusercontent.com/ioiy/nezha_backup/main/bf.sh"
 
@@ -112,9 +112,9 @@ run_backup() {
         exit 1
     fi
 
-    # 如果是 Cron 定时后台运行，启用极致静默低优先级模式 (Feature 3)
+    # 如果是 Cron 定时后台运行，启用极致静默低优先级模式
     if [ "$run_mode" == "cron" ]; then
-        # 降低当前脚本及子进程(tar/rclone)的 CPU 调度优先级
+        # 降低当前脚本及子进程的 CPU 调度优先级
         renice -n 19 -p $$ >/dev/null 2>&1
         # 降低磁盘 IO 优先级
         if command -v ionice >/dev/null 2>&1; then
@@ -122,7 +122,7 @@ run_backup() {
         fi
     fi
 
-    # --- 预检机制: 磁盘空间 (Feature 2) ---
+    # --- 预检机制: 磁盘空间 ---
     if [ "$run_mode" != "cron" ]; then echo "正在进行磁盘空间预检..."; fi
     local NEZHA_SIZE_KB=$(du -sk /opt/nezha 2>/dev/null | awk '{print $1}')
     local AVAIL_SPACE_KB=$(df -k / | awk 'NR==2 {print $4}')
@@ -134,7 +134,7 @@ run_backup() {
         exit 1
     fi
 
-    # --- 预检机制: 数据库完整性 (Feature 1) ---
+    # --- 预检机制: 数据库完整性 ---
     local DB_PATH="/opt/nezha/dashboard/data/sqlite.db"
     if [ -f "$DB_PATH" ]; then
         if command -v sqlite3 >/dev/null 2>&1; then
@@ -151,19 +151,19 @@ run_backup() {
     # 修改日期格式以便于过滤每月1号 (北京时间)
     DATE_STR=$(date +%Y-%m-%d_%H%M)
     
-    # 1. 打包数据与加密
+    # 1. 打包数据与加密 (此处将备份脚本的配置文件 $CONFIG_FILE 一并打包进去)
     if [ -n "$ENCRYPT_PASS" ]; then
         BACKUP_FILE="/root/nezha_backup_${DATE_STR}.tar.gz.enc"
-        [ "$run_mode" != "cron" ] && echo "开始打包并加密 /opt/nezha 目录..."
-        tar -czf - /opt/nezha 2>/dev/null | openssl enc -aes-256-cbc -pbkdf2 -salt -k "$ENCRYPT_PASS" > "$BACKUP_FILE"
+        [ "$run_mode" != "cron" ] && echo "开始打包并加密 /opt/nezha 目录与脚本配置..."
+        tar -czf - /opt/nezha "$CONFIG_FILE" 2>/dev/null | openssl enc -aes-256-cbc -pbkdf2 -salt -k "$ENCRYPT_PASS" > "$BACKUP_FILE"
         if [ $? -ne 0 ]; then
-            send_tg "FAIL" "打包并加密目录失败，请检查磁盘空间或 openssl 依赖。"
+            send_tg "FAIL" "打包并加密失败，请检查磁盘空间或 openssl 依赖。"
             exit 1
         fi
     else
         BACKUP_FILE="/root/nezha_backup_${DATE_STR}.tar.gz"
-        [ "$run_mode" != "cron" ] && echo "开始打包 /opt/nezha 目录..."
-        tar -czf "$BACKUP_FILE" /opt/nezha > /dev/null 2>&1
+        [ "$run_mode" != "cron" ] && echo "开始打包 /opt/nezha 目录与脚本配置..."
+        tar -czf "$BACKUP_FILE" /opt/nezha "$CONFIG_FILE" > /dev/null 2>&1
         if [ $? -ne 0 ]; then
             send_tg "FAIL" "打包目录失败，请检查磁盘空间或权限。"
             exit 1
@@ -199,7 +199,7 @@ run_backup() {
 
     # 4. 扫尾与通知
     rm -f "$BACKUP_FILE"
-    local notify_msg="数据已成功打包上传！%0A📦 文件大小: ${FILE_SIZE}%0A🧹 已清理 ${RETENTION_DAYS} 天前的旧文件。"
+    local notify_msg="数据与脚本配置已成功打包上传！%0A📦 文件大小: ${FILE_SIZE}%0A🧹 已清理 ${RETENTION_DAYS} 天前的旧文件。"
     [ "$RETAIN_FIRST_DAY" == "true" ] && notify_msg="${notify_msg}%0A🛡️ 已过滤每月1号的长效备份。"
     [ -n "$ENCRYPT_PASS" ] && notify_msg="${notify_msg}%0A🔒 数据已进行 AES-256 强加密。"
     
@@ -233,7 +233,7 @@ setup_s3() {
     read -p "请输入 安全访问密钥: " s3_sk
     read -p "请输入 存储桶 (Bucket) 名称: " S3_BUCKET
 
-    # 写入 rclone 配置文件，加入 region 和 force_path_style 修复兼容性问题
+    # 写入 rclone 配置文件
     mkdir -p /root/.config/rclone
     cat > /root/.config/rclone/rclone.conf << EOF
 [nezha_s3]
@@ -268,7 +268,7 @@ quick_check_s3() {
     fi
 }
 
-# 交互式管理 S3 中的备份 (Feature 7)
+# 交互式管理 S3 中的备份
 manage_backups() {
     if [ -z "$S3_BUCKET" ]; then
         clear
@@ -311,11 +311,9 @@ manage_backups() {
         echo "------------------------------------------"
         read -p "请输入操作指令: " action
         
-        # 判断如果为空（直接回车）或者输入 q，则退出循环
         if [ -z "$action" ] || [ "$action" == "q" ] || [ "$action" == "Q" ]; then
             break
         elif [[ "$action" =~ ^r([0-9]+)$ ]]; then
-            # 恢复指定序号
             local idx="${BASH_REMATCH[1]}"
             if [ -n "${FILES[$idx]}" ]; then
                 restore_backup "${FILES[$idx]}"
@@ -324,7 +322,6 @@ manage_backups() {
                 echo -e "\033[31m[错误]\033[0m 无效的序号！" && sleep 1
             fi
         elif [[ "$action" =~ ^[0-9]+$ ]]; then
-            # 删除指定序号
             local idx="$action"
             if [ -n "${FILES[$idx]}" ]; then
                 read -p "⚠️ 确定要永久删除 ${FILES[$idx]} 吗？[y/N]: " del_confirm
@@ -410,7 +407,6 @@ setup_cron() {
     echo "             配置自动备份定时任务             "
     echo "=========================================="
     
-    # 配置 Cron 时，尝试同步系统时区为北京时间，以保证 Cron 执行准确
     echo "正在确保系统时区为北京时间以保障定时执行精准..."
     if command -v timedatectl >/dev/null 2>&1; then
         timedatectl set-timezone Asia/Shanghai 2>/dev/null
@@ -429,7 +425,6 @@ setup_cron() {
     read -p "请选择 [1-5]: " cron_choice
     
     SCRIPT_PATH=$(readlink -f "$0")
-    # 定时任务执行时，传入 cron 参数激活静默模式
     CRON_CMD="$SCRIPT_PATH cron > /dev/null 2>&1"
     
     if [ "$cron_choice" == "5" ]; then
@@ -476,7 +471,6 @@ setup_encryption() {
     sleep 2
 }
 
-# 在线更新脚本 (带版本比对和确认)
 update_script() {
     clear
     echo "=========================================="
@@ -487,12 +481,9 @@ update_script() {
     TMP_FILE="/tmp/nezha_backup_update.sh"
 
     echo -e "正在从 GitHub 获取最新版本信息..."
-    # 核心修复点：添加时间戳 ?t=$(date +%s) 来强制绕过 GitHub Raw CDN 缓存
     curl -L -s "${UPDATE_URL}?t=$(date +%s)" -o "$TMP_FILE"
 
-    # 验证下载是否成功且包含版本号变量
     if [ $? -eq 0 ] && grep -q "^CURRENT_VERSION=" "$TMP_FILE"; then
-        # 提取临时文件中的新版本号
         NEW_VERSION=$(grep "^CURRENT_VERSION=" "$TMP_FILE" | cut -d'"' -f2 | head -n 1)
         
         echo -e "\n当前版本: \033[33mv${CURRENT_VERSION}\033[0m"
@@ -525,13 +516,12 @@ update_script() {
         esac
     else
         echo -e "\n\033[31m[错误]\033[0m 下载失败或文件不完整，无法获取版本信息。"
-        echo -e "请检查服务器网络是否能正常访问 GitHub Raw。"
         rm -f "$TMP_FILE"
         sleep 3
     fi
 }
 
-# 从 S3 恢复指定或最新备份
+# 从 S3 恢复指定或最新备份 (并包含配置重载逻辑)
 restore_backup() {
     local target_file="$1"
     clear
@@ -543,10 +533,8 @@ restore_backup() {
         sleep 2; return
     fi
 
-    # 如果没有通过参数传递文件，则自动寻找最新的
     if [ -z "$target_file" ]; then
         echo "正在连接 S3 获取最新的备份列表..."
-        # 恢复时获取列表也启用网络重试
         target_file=$(execute_with_retry 3 5 rclone lsf "nezha_s3:${S3_BUCKET}/nezha_backups/" --s3-no-check-bucket | grep -E '\.tar\.gz$|\.enc$' | sort -r | head -n 1)
         
         if [ -z "$target_file" ]; then
@@ -557,7 +545,7 @@ restore_backup() {
     fi
 
     echo -e "\n准备恢复备份: \033[32m${target_file}\033[0m"
-    echo -e "\033[31m⚠️ 警告：恢复操作将停止面板服务，并覆盖当前的 /opt/nezha 数据！\033[0m"
+    echo -e "\033[31m⚠️ 警告：恢复操作将停止面板服务，并覆盖当前的 /opt/nezha 及本脚本配置！\033[0m"
     read -p "确定要继续吗？[y/N]: " confirm_restore
     
     if [[ "$confirm_restore" =~ ^[Yy]$ ]]; then
@@ -577,7 +565,7 @@ restore_backup() {
                     input_pass="$ENCRYPT_PASS"
                     echo "🔒 检测到预设了加密密码，正在自动尝试解密..."
                 fi
-                echo "3. 正在解密并解压数据..."
+                echo "3. 正在解密并解压数据与配置文件..."
                 if ! openssl enc -d -aes-256-cbc -pbkdf2 -salt -k "$input_pass" -in "/tmp/${target_file}" | tar -xz -C /; then
                     echo -e "\n\033[31m[错误]\033[0m 解密失败！密码错误或文件已损坏。"
                     systemctl restart nezha-dashboard 2>/dev/null
@@ -586,17 +574,29 @@ restore_backup() {
                     return
                 fi
             else
-                echo "3. 正在解压并覆盖数据..."
+                echo "3. 正在解压并覆盖数据与配置文件..."
                 tar -xzf "/tmp/${target_file}" -C /
             fi
             
-            echo "4. 正在重启面板服务..."
+            echo "4. 正在还原系统与脚本运行配置..."
+            if [ -f "$CONFIG_FILE" ]; then
+                # 重新加载刚解压出的配置文件
+                source "$CONFIG_FILE"
+                
+                # 尝试根据原配置为新服务器注册自动备份 Cron 任务
+                SCRIPT_PATH=$(readlink -f "$0")
+                CRON_CMD="$SCRIPT_PATH cron > /dev/null 2>&1"
+                (crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH"; echo "$CRON_RULE $CRON_CMD") | crontab -
+                echo "   ✅ 已成功迁移并挂载定时任务: $CRON_RULE"
+            fi
+            
+            echo "5. 正在重启面板服务..."
             systemctl restart nezha-dashboard 2>/dev/null
             
-            echo "5. 正在清理临时文件..."
+            echo "6. 正在清理临时文件..."
             rm -f "/tmp/${target_file}"
             
-            echo -e "\n\033[32m[成功]\033[0m 数据恢复完毕，哪吒面板已重新启动！"
+            echo -e "\n\033[32m[成功]\033[0m 数据及配置恢复完毕，哪吒面板已重新启动！"
         else
             echo -e "\n\033[31m[错误]\033[0m 下载备份文件失败，请检查网络或配置。"
             rm -f "/tmp/${target_file}"
