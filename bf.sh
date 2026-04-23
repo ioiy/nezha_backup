@@ -8,7 +8,7 @@
 # 强制本脚本运行环境为北京时间 (东八区)
 export TZ='Asia/Shanghai'
 
-CURRENT_VERSION="1.3.0"
+CURRENT_VERSION="1.4.0"
 CONFIG_FILE="/root/.nezha_backup_config"
 UPDATE_URL="https://raw.githubusercontent.com/ioiy/nezha_backup/main/bf.sh"
 
@@ -471,6 +471,42 @@ setup_encryption() {
     sleep 2
 }
 
+uninstall_script() {
+    clear
+    echo "=========================================="
+    echo "          🗑️ 一键卸载备份脚本             "
+    echo "=========================================="
+    echo -e "\033[31m⚠️ 警告：此操作将删除备份脚本的配置文件、定时任务以及脚本本身！\033[0m"
+    echo "说明：S3 云端备份文件和哪吒面板本身的数据不会受影响，请放心。"
+    echo ""
+    read -p "确定要彻底卸载本脚本吗？[y/N]: " confirm_uninstall
+    
+    if [[ "$confirm_uninstall" =~ ^[Yy]$ ]]; then
+        echo -e "\n1. 正在移除定时任务..."
+        SCRIPT_PATH=$(readlink -f "$0")
+        crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab -
+        
+        echo "2. 正在删除本地配置文件..."
+        rm -f "$CONFIG_FILE"
+        
+        echo "3. 正在清理本地可能残留的临时打包文件..."
+        rm -f /root/nezha_backup_*.tar.gz*
+        rm -f /tmp/nezha_backup_*.tar.gz*
+        
+        echo "4. Rclone 配置处理提示..."
+        echo "   (为避免误删您的其他网盘配置，请后续需要时输入 rclone config 手动删除 nezha_s3 节点)"
+        
+        echo "5. 正在执行自我销毁..."
+        rm -f "$SCRIPT_PATH"
+        
+        echo -e "\n\033[32m[成功]\033[0m 脚本及相关配置已彻底卸载！感谢您的使用，再见 👋"
+        exit 0
+    else
+        echo -e "\n已取消卸载操作。"
+        sleep 2
+    fi
+}
+
 update_script() {
     clear
     echo "=========================================="
@@ -634,9 +670,10 @@ show_menu() {
         echo " 7. 🔄 检查并从 GitHub 更新脚本"
         echo " 8. 🚑 从 S3 一键恢复最新备份"
         echo " 9. 🔒 配置备份文件加密"
+        echo " 10. 🗑️ 一键卸载脚本与相关配置"
         echo " 0. 退出面板"
         echo "=========================================="
-        read -p "请输入选项 [0-9]: " choice
+        read -p "请输入选项 [0-10]: " choice
         
         case $choice in
             1) run_backup "manual" ;;
@@ -648,6 +685,7 @@ show_menu() {
             7) update_script ;;
             8) restore_backup ;;
             9) setup_encryption ;;
+            10) uninstall_script ;;
             0) exit 0 ;;
             *) echo "无效选项，请重新输入" && sleep 1 ;;
         esac
